@@ -79,16 +79,83 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            claims = []
+
+        new_claims = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not isinstance(text, str) or not text:
+                continue
+
+            doc_id = claim.get("doc_id")
+            doc = (
+                ctx.corpus.get(doc_id)
+                if ctx.corpus and isinstance(doc_id, str) else None
+            )
+            supported = (
+                any(text in line for line in doc.body.splitlines())
+                if doc else ctx.corpus is None
+            )
+            if ctx.saw(text) and supported:
+                new_claims.append(claim)
+            else:
+                if " và " in text:
+                    delim = " và "
+                    start = 0
+                    while True:
+                        idx = text.find(delim, start)
+                        if idx == -1:
+                            break
+                        p1 = text[:idx]
+                        p2 = text[idx + len(delim) :]
+                        if ctx.saw(p1) and ctx.saw(p2) and ctx.corpus:
+                            doc1 = next(
+                                (
+                                    d
+                                    for d in ctx.corpus.docs
+                                    if d.body in ctx.observed_text
+                                    and any(p1 in line for line in d.body.splitlines())
+                                ),
+                                None,
+                            )
+                            doc2 = next(
+                                (
+                                    d
+                                    for d in ctx.corpus.docs
+                                    if d.body in ctx.observed_text
+                                    and any(p2 in line for line in d.body.splitlines())
+                                ),
+                                None,
+                            )
+                            if doc1 and doc2 and doc1.doc_id != doc2.doc_id:
+                                new_claims.append({"text": p1, "doc_id": doc1.doc_id})
+                                new_claims.append({"text": p2, "doc_id": doc2.doc_id})
+                                report["abstain"] = True
+                                break
+                        start = idx + len(delim)
+
+        if not new_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = (
+                "Không có đủ căn cứ trong tài liệu để trả lời câu hỏi này."
+            )
+        else:
+            report["claims"] = new_claims
+            report["citations"] = sorted(
+                {c["doc_id"] for c in new_claims
+                 if isinstance(c.get("doc_id"), str) and c["doc_id"]}
+            )
+            # A removed fabrication must not survive in the free-form answer.
+            # Claim quotations themselves remain exact model substrings.
+            if new_claims != claims:
+                report["answer"] = "\n".join(c["text"] for c in new_claims)
+
+        return report
