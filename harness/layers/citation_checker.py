@@ -59,7 +59,41 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+#: Giống `arena.scorer`: claim chuẩn hoá ngắn hơn ngưỡng này hoặc dài hơn
+#: trần kia thì không bao giờ được chấm SUPPORTED.
+MIN_CHARS = 12
+MAX_CHARS = 500
+_WS_RE = re.compile(r"\s+")
+
+
+def norm(text: str) -> str:
+    """Chuẩn hoá đúng như `arena.scorer._norm`: NFC, casefold, gộp khoảng trắng.
+
+    Chỉ dùng để SO KHỚP — không bao giờ ghi kết quả này vào claim.
+    """
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def quoted_in(text, doc) -> bool:
+    """`text` có nằm gọn trong MỘT DÒNG của `doc.body` không (luật của scorer)."""
+    t = norm(text)
+    return MIN_CHARS <= len(t) <= MAX_CHARS and any(
+        t in norm(line) for line in doc.body.splitlines()
+    )
+
+
+def source_of(ctx, text):
+    """doc_id của tài liệu ĐÃ QUAN SÁT TRỌN VẸN có một dòng chứa `text`, hoặc None."""
+    observed = ctx.observed_text
+    for doc in ctx.corpus.docs:
+        if doc.body in observed and quoted_in(text, doc):
+            return doc.doc_id
+    return None
 
 
 class CitationChecker(Middleware):
@@ -68,37 +102,19 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        if not isinstance(report, dict) or ctx.corpus is None:
-            return report
         claims = report.get("claims")
-        if not isinstance(claims, list) or not claims:
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
             return report
-
         for claim in claims:
-            if not isinstance(claim, dict):
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
                 continue
-            text = claim.get("text", "")
-            if not isinstance(text, str) or not text:
+            doc = ctx.corpus.get(str(claim.get("doc_id")).strip())
+            if doc is not None and quoted_in(claim["text"], doc) and doc.body in ctx.observed_text:
                 continue
-            doc_id = claim.get("doc_id", "")
-            doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) and doc_id else None
-
-            if (
-                doc
-                and ctx.saw(text)
-                and any(text in line for line in doc.body.splitlines())
-            ):
-                continue
-
-            for d in ctx.corpus.docs:
-                if d.body in ctx.observed_text and any(
-                    text in line for line in d.body.splitlines()
-                ):
-                    claim["doc_id"] = d.doc_id
-                    break
-
+            real = source_of(ctx, claim["text"])
+            if real is not None:
+                claim["doc_id"] = real  # chỉ đổi nguồn, KHÔNG đổi chữ
         report["citations"] = sorted(
-            {c["doc_id"] for c in claims
-             if isinstance(c, dict) and isinstance(c.get("doc_id"), str) and c["doc_id"]}
+            {c["doc_id"] for c in claims if isinstance(c, dict) and isinstance(c.get("doc_id"), str)}
         )
         return report

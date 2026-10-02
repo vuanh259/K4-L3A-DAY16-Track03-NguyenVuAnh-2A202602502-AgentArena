@@ -70,7 +70,46 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.citation_checker import norm, quoted_in, source_of
+
 from harness.middleware import Middleware
+
+
+JOINER = " và "
+ABSTAIN_ANSWER = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi này."
+#: Trần của scorer: quá số này thì claim bị chấm REDUNDANT / EXCESS (phạt 1.0).
+MAX_PER_DOC = 4
+MAX_CLAIMS = 10
+
+
+def _grounded(ctx, text) -> bool:
+    """Agent đã thấy câu này VÀ nó nằm gọn trong một dòng của một tài liệu.
+
+    Đúng điều kiện scorer dùng để KHÔNG chấm HALLUCINATED: so khớp sau khi
+    chuẩn hoá, theo DÒNG, dài ít nhất `MIN_CHARS`. `ctx.saw(text)` trơn thì
+    vừa quá chặt (lệch khoảng trắng/hoa-thường là xoá nhầm) vừa quá lỏng
+    (câu vắt qua hai dòng, hay mẩu 3 ký tự, vẫn lọt).
+    """
+    if norm(text) not in norm(ctx.observed_text):
+        return False
+    if ctx.corpus is None:
+        return True
+    return any(quoted_in(text, doc) for doc in ctx.corpus.docs)
+
+
+def _split_fused(ctx, text):
+    """Tách câu ghép từ hai tài liệu tại " và " -> [claim, claim] hoặc None."""
+    if ctx.corpus is None:
+        return None
+    start = text.find(JOINER)
+    while start != -1:
+        left, right = text[:start], text[start + len(JOINER):]
+        if _grounded(ctx, left) and _grounded(ctx, right):
+            dl, dr = source_of(ctx, left), source_of(ctx, right)
+            if dl and dr and dl != dr:
+                return [{"text": left, "doc_id": dl}, {"text": right, "doc_id": dr}]
+        start = text.find(JOINER, start + 1)
+    return None
 
 
 class Critic(Middleware):
@@ -79,83 +118,31 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        if not isinstance(report, dict):
-            return report
         claims = report.get("claims")
-        if not isinstance(claims, list):
-            claims = []
-
-        new_claims = []
-        for claim in claims:
-            if not isinstance(claim, dict):
-                continue
-            text = claim.get("text", "")
+        kept = []
+        for claim in claims if isinstance(claims, list) else []:
+            text = claim.get("text") if isinstance(claim, dict) else None
             if not isinstance(text, str) or not text:
                 continue
-
-            doc_id = claim.get("doc_id")
-            doc = (
-                ctx.corpus.get(doc_id)
-                if ctx.corpus and isinstance(doc_id, str) else None
-            )
-            supported = (
-                any(text in line for line in doc.body.splitlines())
-                if doc else ctx.corpus is None
-            )
-            if ctx.saw(text) and supported:
-                new_claims.append(claim)
-            else:
-                if " và " in text:
-                    delim = " và "
-                    start = 0
-                    while True:
-                        idx = text.find(delim, start)
-                        if idx == -1:
-                            break
-                        p1 = text[:idx]
-                        p2 = text[idx + len(delim) :]
-                        if ctx.saw(p1) and ctx.saw(p2) and ctx.corpus:
-                            doc1 = next(
-                                (
-                                    d
-                                    for d in ctx.corpus.docs
-                                    if d.body in ctx.observed_text
-                                    and any(p1 in line for line in d.body.splitlines())
-                                ),
-                                None,
-                            )
-                            doc2 = next(
-                                (
-                                    d
-                                    for d in ctx.corpus.docs
-                                    if d.body in ctx.observed_text
-                                    and any(p2 in line for line in d.body.splitlines())
-                                ),
-                                None,
-                            )
-                            if doc1 and doc2 and doc1.doc_id != doc2.doc_id:
-                                new_claims.append({"text": p1, "doc_id": doc1.doc_id})
-                                new_claims.append({"text": p2, "doc_id": doc2.doc_id})
-                                report["abstain"] = True
-                                break
-                        start = idx + len(delim)
-
-        if not new_claims:
+            if _grounded(ctx, text):
+                kept.append(claim)
+                continue
+            halves = _split_fused(ctx, text)
+            if halves:  # hai nguồn mâu thuẫn -> nêu cả hai phía và abstain
+                kept.extend(halves)
+                report["abstain"] = True
+            # còn lại: bịa -> bỏ
+        per_doc: dict = {}
+        capped = []
+        for claim in kept:
+            key = str(claim.get("doc_id")).strip()
+            per_doc[key] = per_doc.get(key, 0) + 1
+            if per_doc[key] <= MAX_PER_DOC and len(capped) < MAX_CLAIMS:
+                capped.append(claim)
+        kept = capped
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)})
+        if not kept:
             report["abstain"] = True
-            report["claims"] = []
-            report["citations"] = []
-            report["answer"] = (
-                "Không có đủ căn cứ trong tài liệu để trả lời câu hỏi này."
-            )
-        else:
-            report["claims"] = new_claims
-            report["citations"] = sorted(
-                {c["doc_id"] for c in new_claims
-                 if isinstance(c.get("doc_id"), str) and c["doc_id"]}
-            )
-            # A removed fabrication must not survive in the free-form answer.
-            # Claim quotations themselves remain exact model substrings.
-            if new_claims != claims:
-                report["answer"] = "\n".join(c["text"] for c in new_claims)
-
+            report["answer"] = ABSTAIN_ANSWER
         return report

@@ -88,15 +88,13 @@ class Retry(Middleware):
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
         attempts = 1
-        while attempts < self.max_attempts and (
-            not result.ok or is_degraded(result.content)
+        limit = ctx.max_tool_calls
+        while (
+            attempts < self.max_attempts
+            and ((not result.ok) or is_degraded(result.content))
+            and (limit is None or ctx.tools.calls < limit - self.reserve)
         ):
-            if (
-                ctx.max_tool_calls is not None
-                and ctx.tools.calls >= ctx.max_tool_calls - self.reserve
-            ):
-                break
             result = call(name, args)
             attempts += 1
-        ctx.state["retries"] = ctx.state.get("retries", 0) + (attempts - 1)
+        ctx.state["retries"] = ctx.state.get("retries", 0) + attempts - 1
         return result

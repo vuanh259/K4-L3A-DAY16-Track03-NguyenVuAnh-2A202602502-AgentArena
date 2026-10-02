@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    MockModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -152,6 +153,31 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+#: How many times ONE RUN may refuse a FINAL that the evidence cannot back:
+#: a FINAL written before any tool call, or one whose claims quote nothing
+#: the run has read while budget is still left. Measured on the scored
+#: round: the real model wrote FINAL on turn 1 with ZERO tool calls on every
+#: brief (flag `single_model_call`), so every layer had nothing to work on
+#: and nine different harnesses scored an identical 39.47. `MockModel` never
+#: finalises early, so this is a no-op on the practice path.
+MAX_PREMATURE_REFUSALS = 2
+
+#: Tool calls that must still be left (on top of the `submit`) before an
+#: unsupported FINAL is refused: one to re-query, one to fetch.
+PREMATURE_MIN_CALLS_LEFT = 2
+
+#: Told to the model when its FINAL is refused. No FINALIZE_SENTINEL here:
+#: it is the opposite of a "finish now" nudge.
+SEARCH_FIRST_NUDGE = (
+    "Chưa được kết luận: bạn chưa gọi công cụ nào nên chưa có bằng chứng. "
+    "Lượt này hãy viết THOUGHT rồi ACTION gọi search với từ khoá chính của câu hỏi."
+)
+READ_FIRST_NUDGE = (
+    "Chưa được kết luận: không câu trích nào của bạn nằm trong tài liệu đã đọc. "
+    "Lượt này hãy viết THOUGHT rồi ACTION: fetch_doc tài liệu liên quan nhất chưa đọc, "
+    "hoặc search lại bằng thuật ngữ nội bộ khác (tên quy trình, chính sách, phòng ban)."
+)
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -273,6 +299,25 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+
+def _is_mock(model) -> bool:
+    """Is `model` (or the client it wraps, e.g. the runner's
+    `ProvenanceModel.inner`) the offline `MockModel`?"""
+    for _ in range(5):
+        if model is None or isinstance(model, MockModel):
+            return model is not None
+        model = getattr(model, "inner", None)
+    return False
+
+
+def _effective_system_prompt(prompt: str, model) -> str:
+    """The frozen runner passes the BARE `ARENA_SYSTEM_PROMPT`, so the
+    addendum never reached the scored model. Add it here for any model that
+    is not the mock (where it is neutral but costs mock tokens)."""
+    if _is_mock(model) or REAL_MODEL_PROMPT_ADDENDUM.strip() in prompt:
+        return prompt
+    return real_model_system_prompt(prompt)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -486,6 +531,8 @@ class ReActAgent:
         # `run()`; kept on the agent rather than in `ctx.state`, which
         # belongs to the layers.
         self._final_deferrals = 0
+        self._premature_refusals = 0
+        self._read_refused = False
         self._refused_final: dict | None = None
 
     # -- the run -------------------------------------------------------
@@ -502,12 +549,14 @@ class ReActAgent:
         )
         self.last_context = ctx
         self._final_deferrals = 0
+        self._premature_refusals = 0
+        self._read_refused = False
         self._refused_final = None
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
         ctx.messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": _effective_system_prompt(self.system_prompt, self.model)},
             {"role": "user", "content": ctx.question},
         ]
         self.middleware.before_agent(ctx)
@@ -532,9 +581,17 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
-                report = parsed.final if isinstance(parsed.final, dict) else {}
-                ctx.stop_reason = "final"
-                break
+                nudge = self._premature_nudge(ctx, parsed.final)
+                if nudge is None:
+                    report = parsed.final if isinstance(parsed.final, dict) else {}
+                    ctx.stop_reason = "final"
+                    break
+                # Refused, not lost: submitted if no better FINAL follows.
+                self._premature_refusals += 1
+                if isinstance(parsed.final, dict):
+                    self._refused_final = parsed.final
+                ctx.messages.append({"role": "user", "content": nudge})
+                continue
 
             observation = self._observe(ctx, parsed)
             ctx.observations.append(observation)
@@ -558,6 +615,36 @@ class ReActAgent:
         # runner stamps its own `agent_end` with the timing it measured.
         self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
         return report
+
+    # -- refusing an unsupported FINAL -----------------------------------
+
+    def _premature_nudge(self, ctx: AgentContext, final) -> str | None:
+        """The nudge to send instead of accepting this FINAL, or None.
+
+        Refuses (at most `MAX_PREMATURE_REFUSALS` times) a FINAL written
+        before any tool call, and a FINAL none of whose claims quotes the
+        evidence read so far while the budget still allows a re-query and
+        a fetch. Never fires on budget exhaustion, so it cannot fight
+        `budget_policy`.
+        """
+        if self._premature_refusals >= MAX_PREMATURE_REFUSALS:
+            return None
+        if not ctx.observations:
+            return SEARCH_FIRST_NUDGE
+        if self._read_refused:
+            return None
+        limit = ctx.max_tool_calls
+        calls = getattr(ctx.tools, "calls", 0)
+        if limit is None or calls > limit - 1 - PREMATURE_MIN_CALLS_LEFT:
+            return None
+        observed = _squash(ctx.observed_text)
+        claims = final.get("claims") if isinstance(final, dict) else None
+        for claim in claims if isinstance(claims, list) else []:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if isinstance(text, str) and _squash(text) and _squash(text) in observed:
+                return None
+        self._read_refused = True
+        return READ_FIRST_NUDGE
 
     # -- reading the model ---------------------------------------------
 
@@ -671,6 +758,11 @@ class ReActAgent:
         if name == "calc":
             return self.tools.calc(_as_text(args.get("expression")) or "0")
         return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
+
+
+def _squash(text: str) -> str:
+    """Casefold + collapse whitespace — for MATCHING only, never written back."""
+    return " ".join(text.split()).casefold()
 
 
 def _as_text(value) -> str:
